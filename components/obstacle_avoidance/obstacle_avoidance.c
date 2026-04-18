@@ -124,10 +124,10 @@ static uint32_t hcsr04_measure_cm(gpio_num_t trig, gpio_num_t echo)
             return OBSTACLE_OUT_OF_RANGE;
         }
     }
-    int64_t duration_us = esp_timer_get_time() - t_echo_start;
+    int64_t echo_pulse_us = esp_timer_get_time() - t_echo_start;
 
-    /* Distance in cm = duration_µs / 58 */
-    uint32_t dist_cm = (uint32_t)(duration_us / 58);
+    /* Distance in cm = echo_pulse_us / 58 */
+    uint32_t dist_cm = (uint32_t)(echo_pulse_us / 58);
     if (dist_cm > OBSTACLE_OUT_OF_RANGE) {
         dist_cm = OBSTACLE_OUT_OF_RANGE;
     }
