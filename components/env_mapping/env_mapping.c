@@ -107,10 +107,6 @@ static void raycast(env_ctx_t *ctx,
         /* Mark intermediate cells free */
         ctx->grid[r][c] = ENV_CELL_FREE;
 
-        if (c == c1 && r == r1) {
-            break;
-        }
-
         int e2 = 2 * err;
         if (e2 > -dr) { err -= dr; c += sc; }
         if (e2 <  dc) { err += dc; r += sr; }
@@ -214,16 +210,13 @@ void env_mapping_insert_range(env_map_handle_t handle,
         float fy = ctx->pose.y_cm;
         float dx = cosf(total_angle) * step;
         float dy = sinf(total_angle) * step;
-        int   pc = c0, pr = r0;
         float walked = 0.0f;
         while (walked < ray_len) {
             fx += dx; fy += dy; walked += step;
             int nc, nr;
             if (!world_to_cell(fx, fy, &nc, &nr)) break;
             ctx->grid[nr][nc] = ENV_CELL_FREE;
-            pc = nc; pr = nr;
         }
-        (void)pc; (void)pr;
     }
 
     xSemaphoreGive(ctx->lock);
