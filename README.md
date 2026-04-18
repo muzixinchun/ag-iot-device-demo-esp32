@@ -32,7 +32,17 @@
 │   │           ├── libmedia-engine.a
 │   │           ├── librtsa.a
 │   │           └── PLACEHOLDER
-│   └── camera                                  Camera component
+│   ├── camera                                  Camera component
+│   ├── obstacle_avoidance                      HC-SR04 超声波避障组件
+│   │   ├── CMakeLists.txt
+│   │   ├── include
+│   │   │   └── obstacle_avoidance.h
+│   │   └── obstacle_avoidance.c
+│   └── env_mapping                             占用栅格环境建模组件
+│       ├── CMakeLists.txt
+│       ├── include
+│       │   └── env_mapping.h
+│       └── env_mapping.c
 ├── firmware
 │   ├── ag_videodoorbell_esp32.bin
 │   ├── bootloader.bin
@@ -210,6 +220,123 @@ APP 会出现被呼界面，显示 `有人按门铃`，并等待接听。同时�
 随即就能看到门铃端的实时画面了，APP端出图时间通常在 1 秒左右。
 
 点击APP的电话按钮，就可以和门铃端实时对讲。
+
+## 两轮平衡车：避障与环境建模
+
+### 一个 ESP32 是否足够？
+
+| 功能 | 单个 ESP32 | 备注 |
+|------|-----------|------|
+| 基础避障（阈值判断） | ✅ 足够 | HC-SR04 超声波传感器 + GPIO |
+| 多方向避障（≤4 个传感器） | ✅ 足够 | 本仓库 `obstacle_avoidance` 组件已实现 |
+| 局部占用栅格地图 | ⚠️ 有限 | 仅支持小尺寸网格（64×64），本仓库 `env_mapping` 组件已实现 |
+| 完整 SLAM 环境建模 | ❌ 不足 | ESP32 双核被 Wi-Fi/蓝牙栈和电机 PID 占用，剩余算力不足以运行 SLAM |
+
+**结论**：单个 ESP32 能完成基础避障，但无法独立完成全局环境建模（SLAM）。
+
+### 完整避障与环境建模所需的额外硬件
+
+| 硬件 | 型号示例 | 接口 | 作用 |
+|------|---------|------|------|
+| 超声波传感器（避障） | HC-SR04 × 1~4 | GPIO | 前方/侧方障碍物距离检测，最远约 400 cm |
+| 2-D 激光雷达（建图） | RPLIDAR A1 / A2 | UART | 360° 高密度点云（~8 000 点/秒），用于全局地图构建 |
+| IMU（姿态与里程计） | MPU-6050 / MPU-9250 | I2C | 加速度计 + 陀螺仪，辅助平衡控制和航向估计 |
+| 电机编码器（里程计） | 霍尔编码器或光电编码器 | GPIO/PCNT | 精确轮速与位移测量，是 SLAM 里程计的基础 |
+| 协处理器（SLAM 计算） | Raspberry Pi Zero 2 W 或第二块 ESP32-S3（带 PSRAM） | UART / SPI | 承担 Cartographer / Hector SLAM 计算，将结果回传主控 ESP32 |
+
+### 推荐系统架构
+
+```
+┌─────────────────────────────────────────────┐
+│  主控 ESP32 (本仓库)                         │
+│  • 平衡 PID 控制 (MPU-6050 + 电机驱动)       │
+│  • 基础避障 (obstacle_avoidance 组件)         │
+│  • 局部占用栅格 (env_mapping 组件)            │
+│  • Wi-Fi / Agora IoT 数据上报               │
+└──────────────┬──────────────────────────────┘
+               │ UART (激光雷达数据 + 里程计)
+               ▼
+┌─────────────────────────────────────────────┐
+│  协处理器 (Raspberry Pi / 第二块 ESP32-S3)   │
+│  • RPLIDAR A1 驱动                          │
+│  • SLAM 算法 (Hector SLAM / Cartographer)   │
+│  • 全局地图维护与路径规划                     │
+└─────────────────────────────────────────────┘
+```
+
+### 快速使用 obstacle_avoidance 组件
+
+```c
+#include "obstacle_avoidance.h"
+
+static void on_obstacle(obstacle_dir_t dir, uint32_t dist_cm, void *ctx)
+{
+    printf("障碍物！距离 %lu cm，建议方向: %d\n", (unsigned long)dist_cm, dir);
+}
+
+void app_main(void)
+{
+    obstacle_avoidance_cfg_t cfg = {
+        .sensors = {
+            { .trig_pin = GPIO_NUM_5, .echo_pin = GPIO_NUM_18, .position = SENSOR_POS_FRONT },
+            { .trig_pin = GPIO_NUM_19, .echo_pin = GPIO_NUM_21, .position = SENSOR_POS_FRONT_LEFT },
+        },
+        .sensor_count     = 2,
+        .safe_distance_cm = 30,
+        .on_obstacle      = on_obstacle,
+        .cb_ctx           = NULL,
+    };
+    obstacle_handle_t h = obstacle_avoidance_init(&cfg);
+    // 模块在后台任务中每 100 ms 自动触发测量并调用回调
+}
+```
+
+### 快速使用 env_mapping 组件
+
+```c
+#include "env_mapping.h"
+
+void update_map_from_sensor(env_map_handle_t map, float range_cm)
+{
+    // 传感器安装在正前方（相对航向 0 rad）
+    env_mapping_insert_range(map, 0.0f, range_cm, 400.0f);
+}
+
+void app_main(void)
+{
+    env_map_handle_t map = env_mapping_create();
+
+    // 更新机器人位姿（由里程计提供）
+    env_pose_t pose = { .x_cm = 10.0f, .y_cm = 0.0f, .heading = 0.0f };
+    env_mapping_set_pose(map, &pose);
+
+    // 插入一次超声波测量值
+    update_map_from_sensor(map, 80.0f);
+
+    // 检查前方路径是否畅通
+    if (!env_mapping_path_is_clear(map, 30.0f)) {
+        printf("前方有障碍物！\n");
+    }
+
+    env_mapping_destroy(map);
+}
+```
+
+### 组件目录结构
+
+```
+components/
+├── obstacle_avoidance/         # HC-SR04 避障模块
+│   ├── CMakeLists.txt
+│   ├── include/
+│   │   └── obstacle_avoidance.h
+│   └── obstacle_avoidance.c
+└── env_mapping/                # 占用栅格环境建模模块
+    ├── CMakeLists.txt
+    ├── include/
+    │   └── env_mapping.h
+    └── env_mapping.c
+```
 
 ## 关于声网
 
